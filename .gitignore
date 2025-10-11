@@ -1,2 +1,9 @@
+# 1. 仮想環境ディレクトリ
 /venv
-/__pycache__
+/.venv
+/env
+/.env
+
+# 2. Python バイトコードと一時ファイル
+__pycache__/
+*.pyc
