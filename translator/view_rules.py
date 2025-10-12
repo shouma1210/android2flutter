@@ -1,6 +1,6 @@
 # convert_tool/translator/view_rules.py
 from ..parser.resource_resolver import ResourceResolver
-from .layout_rules import indent, apply_layout_modifiers
+from ..utils import indent, apply_layout_modifiers
 
 def translate_view(node, resolver):
     t = node["type"]
