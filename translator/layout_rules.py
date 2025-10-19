@@ -3,13 +3,17 @@ from ..parser.resource_resolver import ResourceResolver
 from ..utils import indent, apply_layout_modifiers
 
 
-def translate_layout(node, resolver):
+def translate_layout(node, resolver, logic_map=None):
+    """
+    Androidのレイアウト(ViewGroup)をFlutterウィジェットに変換する。
+    logic_map は view_id → ハンドラ名 (_onXxxPressed) のマッピング。
+    """
     t = node["type"]
     attrs = node.get("attrs", {})
     children = node.get("children", [])
 
-    # 再帰的に子ノードをDart変換
-    dart_children = [translate_node(ch, resolver) for ch in children]
+    # 子に logic_map を渡す
+    dart_children = [translate_node(ch, resolver, logic_map=logic_map) for ch in children]
     children_list = ",\n".join(dart_children) if dart_children else ""
 
     # ========== LinearLayout ==========
@@ -125,17 +129,10 @@ def translate_layout(node, resolver):
     return apply_layout_modifiers(body, attrs, resolver)
 
 
-def translate_node(node, resolver):
+def translate_node(node, resolver, logic_map=None):
     t = node["type"]
-
-    # "androidx.constraintlayout.widget.ConstraintLayout" のような完全修飾タグも拾う
-    if (
-        "LinearLayout" in t
-        or "FrameLayout" in t
-        or "RelativeLayout" in t
-        or "ConstraintLayout" in t
-    ):
-        return translate_layout(node, resolver)
-
+    if ("LinearLayout" in t or "FrameLayout" in t or
+        "RelativeLayout" in t or "ConstraintLayout" in t):
+        return translate_layout(node, resolver, logic_map)
     from .view_rules import translate_view
-    return translate_view(node, resolver)
+    return translate_view(node, resolver, logic_map)
