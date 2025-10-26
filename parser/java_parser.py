@@ -1,68 +1,115 @@
-# android2flutter/parser/java_parser.py
-import os, re
+# android2flutter/translator/java_parser.py
+import re
+from pathlib import Path
 
-# まずは正規表現ベース(MVP)。必要に応じて javalang や tree-sitter でAST化に置換可。
-# 返り値: { "<xml-id>": "Dart の onPressed/onTap 本体コード" }
-def parse_java_logic(java_path_or_dir):
-    sources = []
-    if os.path.isdir(java_path_or_dir):
-        for root, _, files in os.walk(java_path_or_dir):
-            for fn in files:
-                if fn.endswith(".java"):
-                    sources.append(os.path.join(root, fn))
-    elif os.path.isfile(java_path_or_dir):
-        sources.append(java_path_or_dir)
+# ---------- 公開API ----------
+def parse_click_handlers(java_paths):
+    """
+    与えられた Java ファイル群から setOnClickListener(...) を検出し、
+    {xml_id: dart_handler_body} の dict を返す。
+    """
+    if isinstance(java_paths, (str, Path)):
+        java_paths = [java_paths]
 
-    logic = {}  # id -> dart handler body
+    logic = {}
 
-    for p in sources:
-        with open(p, encoding="utf-8", errors="ignore") as f:
-            code = f.read()
+    for p in java_paths:
+        src = Path(p).read_text(encoding="utf-8", errors="ignore")
 
-        # ViewBinding: binding.signupRedirectText.setOnClickListener(...)
-        for m in re.finditer(r"binding\.([A-Za-z0-9_]+)\.setOnClickListener\s*\(\s*new\s+View\.OnClickListener\s*\(\)\s*\{\s*@Override\s*public\s*void\s*onClick\s*\([^\)]*\)\s*\{\s*(?P<body>.*?)\}\s*\}\s*\)\s*;", code, re.S):
-            field = m.group(1)  # 例: signupRedirectText / loginButton
-            body = _java_body_to_dart(m.group("body"))
-            # binding のフィールド名 → XML の id に一致する前提（Android Studio が生成）
-            logic[field] = body
+        # 1) var = findViewById(R.id.someId);
+        var_to_id = _collect_var_to_id(src)
 
-        # 古典 findViewById + 変数.setOnClickListener(...)
-        # 1) 変数 ← findViewById(R.id.xxx)
-        id_by_var = {}
-        for mv in re.finditer(r"([A-Za-z0-9_]+)\s*=\s*findViewById\s*\(\s*R\.id\.([A-Za-z0-9_]+)\s*\)\s*;", code):
-            var, rid = mv.group(1), mv.group(2)
-            id_by_var[var] = rid
-        # 2) var.setOnClickListener(...)
-        for m in re.finditer(r"([A-Za-z0-9_]+)\.setOnClickListener\s*\(\s*new\s+View\.OnClickListener\s*\(\)\s*\{\s*@Override\s*public\s*void\s*onClick\s*\([^\)]*\)\s*\{\s*(?P<body>.*?)\}\s*\}\s*\)\s*;", code, re.S):
-            var = m.group(1)
-            body = _java_body_to_dart(m.group("body"))
-            rid = id_by_var.get(var)
-            if rid:
-                logic[rid] = body
+        # 2) ラムダ形式 onClick: view.setOnClickListener(v -> { ... });
+        for m in re.finditer(
+            r'(\b[\w\.]+)\.setOnClickListener\s*\(\s*[\w\(\)\s]*->\s*\{(?P<body>.*?)\}\s*\)\s*;',
+            src, flags=re.S
+        ):
+            target = m.group(1)          # e.g. btnLogin / binding.tvSignup
+            body_java = m.group('body')
+            xml_id = _resolve_xml_id_from_target(target, var_to_id)
+            if not xml_id:
+                continue
+            logic[xml_id] = _to_dart(body_java)
+
+        # 3) 匿名クラス形式 onClick: new View.OnClickListener(){ public void onClick(View v){ ... }}
+        for m in re.finditer(
+            r'(\b[\w\.]+)\.setOnClickListener\s*\(\s*new\s+View\.OnClickListener\s*\(\)\s*\{\s*.*?onClick\s*\(\s*View\s+\w+\s*\)\s*\{(?P<body>.*?)\}\s*\}\s*\)\s*;',
+            src, flags=re.S
+        ):
+            target = m.group(1)
+            body_java = m.group('body')
+            xml_id = _resolve_xml_id_from_target(target, var_to_id)
+            if not xml_id:
+                continue
+            logic[xml_id] = _to_dart(body_java)
 
     return logic
 
 
-def _java_body_to_dart(body: str) -> str:
-    # ざっくりインテント遷移 / finish / Toast を Dart に写像 (必要に応じて拡張)
-    t = body
+# ---------- 内部ヘルパ ----------
 
-    # startActivity(new Intent(X.this, Y.class));
-    t = re.sub(
-        r"startActivity\s*\(\s*new\s+Intent\s*\(\s*[^,]+,\s*([A-Za-z0-9_]+)\.class\s*\)\s*\)\s*;",
-        r"Navigator.push(context, MaterialPageRoute(builder: (context) => \1()));",
-        t
+def _collect_var_to_id(src: str):
+    """
+    Java から 変数名→XML id の対応を拾う。
+    例:
+      Button btnLogin = findViewById(R.id.btnLogin);
+      tvSignup = findViewById(R.id.tvSignup);
+    """
+    var_to_id = {}
+    # 型あり/なしの両方に対応
+    for m in re.finditer(
+        r'(?:\b\w+\s+)?(\w+)\s*=\s*(?:\(\s*\w+\s*\)\s*)?findViewById\s*\(\s*R\.id\.(\w+)\s*\)\s*;',
+        src
+    ):
+        var, xml_id = m.group(1), m.group(2)
+        var_to_id[var] = xml_id
+    return var_to_id
+
+
+
+def _resolve_xml_id_from_target(target: str, var_to_id: dict):
+    """
+    target は "btnLogin" or "binding.tvSignup" のような形を想定。
+    binding.* の場合は末尾名を取り、var_to_id があればそれを優先。
+    """
+    last = target.split('.')[-1]
+    if last in var_to_id:
+        return var_to_id[last]
+    # binding.xx は xx がそのまま id 名になっているケースが多い
+    return last
+
+
+def _activity_to_widget(java_activity_name: str) -> str:
+    """
+    Java の 'SignupActivity' -> Dart 'ConvertedSignup'
+    Java の 'LoginActivity'  -> Dart 'ConvertedLogin'
+    """
+    name = java_activity_name
+    if name.endswith("Activity"):
+        name = name[:-8]  # remove 'Activity'
+    return f"Converted{name}"
+
+
+def _to_dart(body_java: str) -> str:
+    """
+    onClick 本体(Java)を Dart 断片に置換する。
+    ここでは最低限の遷移/finish をサポート。
+    """
+    s = body_java
+
+    # startActivity(new Intent(this, SignupActivity.class));
+    # startActivity(new Intent(LoginActivity.this, SignupActivity.class));
+    s = re.sub(
+        r'startActivity\s*\(\s*new\s+Intent\s*\([^,]+,\s*(\w+)Activity\s*\.class\)\s*\)\s*;',
+        lambda m: f"Navigator.push(context, MaterialPageRoute(builder: (_) => {_activity_to_widget(m.group(1)+'Activity')}()));",
+        s
     )
 
     # finish();
-    t = re.sub(r"\bfinish\s*\(\s*\)\s*;", r"Navigator.pop(context);", t)
+    s = re.sub(r'\bfinish\s*\(\s*\)\s*;', r'Navigator.maybePop(context);', s)
 
-    # Toast.makeText(ctx, "msg", Toast.LENGTH_SHORT).show();
-    t = re.sub(
-        r"Toast\.makeText\([^,]+,\s*\"([^\"]*)\",\s*Toast\.[A-Z_]+\)\.show\(\)\s*;",
-        r"ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(\"\1\")));",
-        t
-    )
+    # Toast.* は簡易コメント化
+    s = re.sub(r'Toast\.makeText\(.*?\)\.show\(\)\s*;', r'// TODO: show a SnackBar/Toast', s, flags=re.S)
 
-    # getText() -> controller.text 等は後で本格対応。ここは素通し。
-    return t.strip()
+    # Java文末; は Dart 文としてもOKなので残す
+    return s.strip()
